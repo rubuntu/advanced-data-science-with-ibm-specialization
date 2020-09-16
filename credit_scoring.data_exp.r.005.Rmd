@@ -1,0 +1,547 @@
+---
+title: "Credit Scoring"
+output: html_notebook
+jupyter:
+  jupytext:
+    formats: ipynb,Rmd
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.2'
+      jupytext_version: 1.3.0
+  kernelspec:
+    display_name: R
+    language: R
+    name: ir
+---
+
+# Use Case: Credit Scoring using Lending Club Loan Data
+
+### Dataset: Lending Club Loan Data at Kaggle.com   
+* https://www.kaggle.com/wordsforthewise/lending-club    
+
+```{r warning=FALSE, message=FALSE}
+options(scipen=999)
+options(warn=-1)
+suppressWarnings(suppressPackageStartupMessages({
+  library(data.table)
+  library(funModeling)
+  library(sqldf)
+  library(readxl)
+  library(dplyr)
+  library(DescTools)
+  library(usmap)
+}))
+```
+
+### Get the data
+
+```{r warning=FALSE}
+dt <- fread("data/accepted_2007_to_2018Q4.csv.gz",showProgress=FALSE,na.strings="")
+```
+
+```{r}
+# # sampling
+# library(dplyr)
+# set.seed(1)
+# dt <- dt %>%
+#   group_by(loan_status) %>%
+#   sample_frac(0.1)
+```
+
+### Describe the Dataset
+
+```{r warning=FALSE}
+# Print dimensions: Rows, Columns
+dim(dt)
+```
+
+```{r warning=FALSE}
+# Load variable descriptions from Data Dictionary 
+data_dictionary <- read_excel("data/LCDataDictionary.xlsx")
+
+dt_status <- df_status(dt,print_results=F)
+dt_status <- sqldf("select Description description, dt_status.* 
+                   from dt_status
+                   left join data_dictionary 
+                   on variable=LoanStatNew")
+dt_status
+```
+### Variables: "issue_month", "issue_year"
+```{r warning=FALSE}
+dt$issue_month=substring(dt$issue_d,1,3)
+dt$issue_year=substring(dt$issue_d,5)
+```
+
+```{r warning=FALSE}
+# Review "loan_status"
+sqldf("select loan_status, count(*),  100.0 * count(*) / (select count(*) from dt) pc
+      from dt 
+      group by loan_status order by 2 desc")
+```
+
+```{r warning=FALSE}
+# Status for "bad" loans
+bad_loan_status <- c("Charged Off",
+                    "Default",
+                    "Does not meet the credit policy. Status:Charged Off",
+                    "In Grace Period", 
+                    "Default Receiver", 
+                    "Late (16-30 days)",
+                    "Late (31-120 days)")
+```
+
+### Variable to be predicted: "loan_outcome"
+
+```{r warning=FALSE}
+# Assign certain statuses to a 'bad' ('1') loan_out_come 
+dt$loan_outcome  <- as.factor(ifelse(dt$loan_status %in% bad_loan_status, 1,
+                          ifelse(dt$loan_status=="", NA, 0)
+                          ))
+```
+
+```{r warning=FALSE}
+# Bad and good loans
+sqldf("select loan_status, loan_outcome, count(*) count, 100.0 * count(*) / (select count(*) from dt) pc
+        from dt 
+        where loan_status>''
+        group by loan_status 
+        union
+        select \"---- Subtotal ----\", loan_outcome, count(*) , 100.0 * count(*) / (select count(*) from dt)
+        from dt 
+        where loan_status>''
+        group by loan_outcome 
+        order by 2, 3 desc")
+```
+
+The dataset appears to be unbalanced with respect to the target variable "loan_outcome", where near 13% of the sample is marked as "bad".  
+Working on credits that were "Fully Paid" and bad credits, not using loans with "Current" status, would make the dataset less unbalanced.  
+It would also serve to work with credits that have completed their cycle or failed, whichever comes first.
+
+```{r warning=FALSE}
+# Remove rows where variable "loan_status" is "Current" or NULL
+dt <-  dt[!(dt$loan_status == "Current" | is.na(dt$loan_status)),]
+```
+
+```{r warning=FALSE}
+# Bad and good loans
+sqldf("select loan_status, loan_outcome, count(*) count, 100.0 * count(*) / (select count(*) from dt) pc
+        from dt 
+        group by loan_status 
+        union all
+        select \"---- Subtotal ----\", loan_outcome, count(*) , 100.0 * count(*) / (select count(*) from dt)
+        from dt 
+        group by loan_outcome 
+        order by 2, 3 desc")
+```
+
+The dataset is still unbalanced but the proportion of bad credits has risen to near 22%
+
+```{r warning=FALSE}
+# Bad credits by year
+sqldf("select issue_year, count(*), avg(loan_outcome)
+       from dt
+       group by issue_year
+       union 
+       select '--- Total ---', count(*), avg(loan_outcome)
+       from dt
+       order by 1")
+```
+It can be seen that the credits issued in 2007 and 2008 that already completed their cycle deteriorated 26% and 21% respectively. This may be due to the 2008 crisis.    
+This does not repeat in the sample until 2015 and worsens in 2106, 2017 and 2018, averaging 22% deterioration.
+
+
+As for the non-numeric variables, I will use those that have equal to or less than 100 instances, because I intend to encode the categorical variables using one-hot-encoding, so as not to have widely dispersed data. Special cases are the variable "id", which will not be encoded and the variable "issue_d" (issue date), of which the part of the month of the date will be used, in order to capture seasonality.
+
+```{r warning=FALSE}
+dt_status <- df_status(dt,print_results=FALSE)
+```
+
+```{r warning=FALSE}
+# Not using variables with a lot of categories
+vars_category2drop=sqldf("
+  select variable from dt_status 
+  where \"type\"='character' and \"unique\">60
+  and variable not in ('id','issue_d')
+")$variable
+vars_category2drop
+```
+
+Variables with constant values will be eliminated
+```{r warning=FALSE}
+# Eliminating variables with 1 unique values <=1
+vars_unique=sqldf("select variable from dt_status where \"unique\"<=1")$variable
+# vars_unique
+```
+
+Variables with more than 50% of missing values will be eliminated
+
+```{r warning=FALSE}
+# Variables with many nulls to drop
+vars_with_many_nulls<-sqldf("select variable from dt_status where p_na>50")$variable
+# vars_with_many_nulls
+```
+
+```{r warning=FALSE}
+vars_2drop=append(vars_category2drop,vars_unique)
+vars_2drop=append(vars_2drop,vars_with_many_nulls)
+vars_2drop
+```
+
+```{r warning=FALSE}
+# More variables to exclude
+
+dt$loan_status=NULL           # Not used, grouped in "loan_outcome"
+dt$issue_d=NULL               # Not used as date, just the "month" part to capture seasonality
+dt$issue_year=NULL            # Not used as year, the model to build should be generalized for every year
+
+```
+
+```{r warning=FALSE}
+# These variables do not appear to be part of lean origin. They are removed to avoid data leaking
+dt$out_prncp_inv=NULL
+dt$recoveries=NULL
+dt$collection_recovery_fee=NULL
+dt$acc_now_delinq=NULL
+dt$num_tl_120dpd_2m=NULL
+dt$pub_rec_bankruptcies=NULL
+dt$hardship_flag=NULL
+dt$debt_ssettlement_flag=NULL
+dt$pymnt_plan=NULL
+dt$collections_12_mths_ex_med=NULL
+dt$total_rec_late_fee=NULL
+dt$total_rec_prncp=NULL
+dt$total_pymnt_inv=NULL
+dt$total_pymnt=NULL
+dt$out_prncp=NULL
+dt$total_rec_int=NULL
+#dt$pub_rec
+#dt$inq_last_6mths
+# LC grades
+dt$grade=NULL
+dt$sub_grade=NULL
+
+```
+
+```{r warning=FALSE}
+vars=colnames(dt)
+vars=setdiff(vars,vars_2drop)
+```
+
+```{r warning=FALSE}
+dt=dt[,vars,with=FALSE]
+```
+
+```{r warning=FALSE}
+dt_status <- df_status(dt,print_results=FALSE)
+dt_status <- sqldf("select Description description, dt_status.* 
+                   from dt_status
+                   left join data_dictionary 
+                   on variable=LoanStatNew")
+dt_status
+```
+
+## Univariate Plot & Analysis
+
+```{r}
+# loan_amnt : The listed amount of the loan applied for by the borrower. If at some point in time, the credit department reduces the loan amount, then it will be reflected in this value.
+Desc(dt$loan_amnt, plotit = TRUE)
+```
+
+```{r}
+# funded_amnt : The total amount committed to that loan at that point in time.
+Desc(dt$funded_amnt, plotit = TRUE)
+```
+
+```{r}
+# funded_amnt_inv : The total amount committed by investors for that loan at that point in time.
+Desc(dt$funded_amnt_inv, plotit = TRUE)
+```
+
+```{r}
+# term : The number of payments on the loan. Values are in months and can be either 36 or 60.
+Desc(dt$term, plotit = TRUE)
+```
+
+```{r}
+# int_rate : Interest Rate on the loan
+Desc(dt$int_rate, plotit = TRUE)
+```
+
+```{r}
+# installment : The monthly payment owed by the borrower if the loan originates.
+Desc(dt$installment, plotit = TRUE)
+```
+
+```{r}
+# emp_length : Employment length in years. Possible values are between 0 and 10 where 0 means less than one year and 10 means ten or more years.
+Desc(dt$emp_length, plotit = TRUE)
+```
+
+```{r}
+# home_ownership : The home ownership status provided by the borrower during registration or obtained from the credit report. Our values are: RENT, OWN, MORTGAGE, OTHER
+Desc(dt$home_ownership, plotit = TRUE)
+```
+
+```{r}
+# annual_inc : The self-reported annual income provided by the borrower during registration.
+Desc(dt$annual_inc, plotit = TRUE)
+```
+
+```{r}
+# verification_status : Indicates if income was verified by LC, not verified, or if the income source was verified
+Desc(dt$verification_status, plotit = TRUE)
+```
+
+```{r}
+# pymnt_plan : Indicates if a payment plan has been put in place for the loan
+# Desc(dt$pymnt_plan, plotit = TRUE)
+```
+
+```{r}
+# purpose : A category provided by the borrower for the loan request.
+Desc(dt$purpose, plotit = TRUE)
+```
+
+```{r}
+# addr_state : The state provided by the borrower in the loan application
+Desc(dt$addr_state, plotit = TRUE)
+```
+
+```{r}
+# dti : A ratio calculated using the borrower’s total monthly debt payments on the total debt obligations, excluding mortgage and the requested LC loan, divided by the borrower’s self-reported monthly income.
+Desc(dt$dti, plotit = TRUE)
+```
+
+```{r}
+# delinq_2yrs : The number of 30+ days past-due incidences of delinquency in the borrower's credit file for the past 2 years
+Desc(dt$delinq_2yrs, plotit = TRUE)
+```
+
+```{r}
+# inq_last_6mths : The number of inquiries in past 6 months (excluding auto and mortgage inquiries)
+Desc(dt$inq_last_6mths, plotit = TRUE)
+```
+
+```{r}
+# open_acc : The number of open credit lines in the borrower's credit file.
+Desc(dt$open_acc, plotit = TRUE)
+```
+
+```{r}
+# pub_rec : Number of derogatory public records
+Desc(dt$pub_rec, plotit = TRUE)
+```
+
+```{r}
+# revol_bal : Total credit revolving balance
+Desc(dt$revol_bal, plotit = TRUE)
+```
+
+```{r}
+# revol_util : Revolving line utilization rate, or the amount of credit the borrower is using relative to all available revolving credit.
+Desc(dt$revol_util, plotit = TRUE)
+```
+
+```{r}
+# total_acc : The total number of credit lines currently in the borrower's credit file
+Desc(dt$total_acc, plotit = TRUE)
+```
+
+```{r}
+# initial_list_status : The initial listing status of the loan. Possible values are – W, F
+Desc(dt$initial_list_status, plotit = TRUE)
+```
+
+```{r}
+# last_pymnt_amnt : Last total payment amount received
+Desc(dt$last_pymnt_amnt, plotit = TRUE)
+```
+
+```{r}
+# application_type : Indicates whether the loan is an individual application or a joint application with two co-borrowers
+Desc(dt$application_type, plotit = TRUE)
+```
+
+```{r}
+# tot_coll_amt : Total collection amounts ever owed
+Desc(dt$tot_coll_amt, plotit = TRUE)
+```
+
+```{r}
+# tot_cur_bal : Total current balance of all accounts
+Desc(dt$tot_cur_bal, plotit = TRUE)
+```
+
+```{r}
+# total_rev_hi_lim : NA
+Desc(dt$total_rev_hi_lim, plotit = TRUE)
+```
+
+```{r}
+# issue_month : NA
+Desc(dt$issue_month, plotit = TRUE)
+```
+
+```{r}
+# loan_outcome : NA
+Desc(dt$loan_outcome, plotit = TRUE)
+```
+
+
+## Bivariate Analysis
+
+Target (loan_outcome) profiling: The following charts tries to show if a variable is important or not, with respect to the target variable (loan_outcome) by making a visual summary of it.
+
+```{r}
+# Cross Plot 'loan_amnt' vs 'loan_outcome'
+cross_plot(dt, input='loan_amnt', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'funded_amnt' vs 'loan_outcome'
+cross_plot(dt, input='funded_amnt', target='loan_outcome'
+           #
+           )
+```
+
+```{r}
+# Cross Plot 'funded_amnt_inv' vs 'loan_outcome'
+cross_plot(dt, input='funded_amnt_inv', target='loan_outcome'
+           #
+           )
+```
+
+```{r}
+# Cross Plot 'term' vs 'loan_outcome'
+cross_plot(dt, input='term', target='loan_outcome'
+           #
+           )
+```
+
+```{r}
+# Cross Plot 'int_rate' vs 'loan_outcome'
+cross_plot(dt, input='int_rate', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'installment' vs 'loan_outcome'
+cross_plot(dt, input='installment', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'emp_length' vs 'loan_outcome'
+cross_plot(dt, input='emp_length', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'home_ownership' vs 'loan_outcome'
+cross_plot(dt, input='home_ownership', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'annual_inc' vs 'loan_outcome'
+cross_plot(dt, input='annual_inc', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'verification_status' vs 'loan_outcome'
+cross_plot(dt, input='verification_status', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'purpose' vs 'loan_outcome'
+cross_plot(dt, input='purpose', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'dti' vs 'loan_outcome'
+cross_plot(dt, input='dti', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'delinq_2yrs' vs 'loan_outcome'
+cross_plot(dt, input='delinq_2yrs', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'inq_last_6mths' vs 'loan_outcome'
+cross_plot(dt, input='inq_last_6mths', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'open_acc' vs 'loan_outcome'
+cross_plot(dt, input='open_acc', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'pub_rec' vs 'loan_outcome'
+cross_plot(dt, input='pub_rec', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'revol_bal' vs 'loan_outcome'
+cross_plot(dt, input='revol_bal', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'revol_util' vs 'loan_outcome'
+cross_plot(dt, input='revol_util', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'total_acc' vs 'loan_outcome'
+cross_plot(dt, input='total_acc', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'initial_list_status' vs 'loan_outcome'
+cross_plot(dt, input='initial_list_status', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'last_pymnt_amnt' vs 'loan_outcome'
+cross_plot(dt, input='last_pymnt_amnt', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'application_type' vs 'loan_outcome'
+cross_plot(dt, input='application_type', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'tot_coll_amt' vs 'loan_outcome'
+cross_plot(dt, input='tot_coll_amt', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'tot_cur_bal' vs 'loan_outcome'
+cross_plot(dt, input='tot_cur_bal', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'total_rev_hi_lim' vs 'loan_outcome'
+cross_plot(dt, input='total_rev_hi_lim', target='loan_outcome')
+```
+
+```{r}
+# Cross Plot 'issue_month' vs 'loan_outcome'
+cross_plot(dt, input='issue_month', target='loan_outcome')
+```
+
+```{r warning=FALSE}
+df_map=sqldf("select addr_state state, avg(loan_outcome)  avg_loan_outcome from dt group by addr_state")
+
+plot_usmap(data = df_map, values = "avg_loan_outcome", color = "red") + 
+  labs(title = "Average loan_outcome by state") +
+  scale_fill_continuous(
+    low = "white", high = "red", name = "avg(loan_outcome)", label = scales::comma
+  ) + theme(legend.position = "right")
+```
+
+```{r}
+# Write CSV
+fwrite(dt, "data/loan.csv.gz")
+```
+
+
